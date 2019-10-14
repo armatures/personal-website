@@ -1,14 +1,21 @@
 --------------------------------------------------------------------------------
 {-# LANGUAGE OverloadedStrings #-}
 
-import           Data.Monoid          (mappend)
+import           Data.Monoid           (mappend)
 import           Hakyll
 
-import           PandocFilterGraphviz (renderAll, stripHeading)
-import           Text.Pandoc          (Format (..), Pandoc, WriterOptions (..))
-import           Text.Pandoc.Walk     (walk, walkM)
+import qualified Data.ByteString.Char8 as Char8
+import           Data.ByteString.Lazy  (ByteString, unpack)
+import qualified Data.Text             as T
+import           Debug.Trace           as Tr
+import           PandocFilterGraphviz
 
-import           Hakyll.Web.Html      (withUrls)
+import           Text.Pandoc           (Format (..), Pandoc, ReaderOptions,
+                                        WriterOptions (..), runIO, writeLaTeX)
+import           Text.Pandoc.PDF       (makePDF)
+import           Text.Pandoc.Walk      (walk, walkM)
+
+import           Hakyll.Web.Html       (withUrls)
 
 --------------------------------------------------------------------------------
 main :: IO ()
@@ -30,6 +37,19 @@ main =
       route idRoute
       compile compressCssCompiler
     match "posts/*" $ do
+      version "pdf" $ do
+        route $ setExtension "pdf"
+        -- todo find a way we can pass the context here
+        compile $ do
+          body@(Item id bod) <- getResourceBody
+          readPandocWith defaultHakyllReaderOptions body >>=
+            relativizeUrlsWithCompiler "." >>=
+            traverse
+              (unsafeCompiler .
+               walkM
+                 (renderAll $
+                  RenderAllOptions {urlPrefix = Just "./", renderFormat = EPS})) >>=
+            writePandocLatexWith body
       version "full" $ do
         route $ setExtension "html"
         compile $
@@ -39,9 +59,7 @@ main =
           saveSnapshot "content"
       version "teaser" $ do
         route $ setExtension "toc-html"
-        compile $
-          customTeaserPandocCompiler >>=
-          saveSnapshot "content"
+        compile $ customTeaserPandocCompiler >>= saveSnapshot "content"
     match "index.html" $ do
       route idRoute
       compile $ do
@@ -74,12 +92,12 @@ main =
     create ["atom.xml"] $ do
       route idRoute
       compile $ do
-          let feedCtx = postCtx `mappend` bodyField "description"
-
+        let feedCtx = postCtx `mappend` bodyField "description"
                   -- constField "description" "This is the post description"
-          posts <- fmap (take 10) . recentFirst =<< loadAllSnapshots ("posts/*" .&&. hasVersion "full") "content"
-
-          renderAtom feedConfiguration feedCtx posts
+        posts <-
+          fmap (take 10) . recentFirst =<<
+          loadAllSnapshots ("posts/*" .&&. hasVersion "full") "content"
+        renderAtom feedConfiguration feedCtx posts
 
 --------------------------------------------------------------------------------
 baseUrl :: String
@@ -93,29 +111,27 @@ authorName = "Justus Perlwitz"
 
 pageDefaultContext :: Context String
 pageDefaultContext =
-  constField "baseUrl" baseUrl `mappend`
-  constField "pageTitle" pageTitle `mappend`
+  constField "baseUrl" baseUrl `mappend` constField "pageTitle" pageTitle `mappend`
   constField "authorName" authorName `mappend`
   defaultContext
 
 postCtx :: Context String
 postCtx =
-  dateField "lastmod" "%Y-%m-%d" `mappend`
-  dateField "date" "%B %e, %Y" `mappend`
+  dateField "lastmod" "%Y-%m-%d" `mappend` dateField "date" "%B %e, %Y" `mappend`
   pageDefaultContext
 
 teaserCtx :: Context String
 teaserCtx = teaserField "teaser" "content" `mappend` postCtx
 
-
 --- For RSS
 feedConfiguration :: FeedConfiguration
-feedConfiguration = FeedConfiguration
-    { feedTitle       = pageTitle
+feedConfiguration =
+  FeedConfiguration
+    { feedTitle = pageTitle
     , feedDescription = "Articles about software and life"
-    , feedAuthorName  = authorName
+    , feedAuthorName = authorName
     , feedAuthorEmail = "hello@justus.pw"
-    , feedRoot        = baseUrl
+    , feedRoot = baseUrl
     }
 
 ---
@@ -137,7 +153,9 @@ customPostPandocCompiler =
   pandocCompilerWithTransformM
     defaultHakyllReaderOptions
     postHakyllWriterOptions
-    (unsafeCompiler . walkM renderAll)
+    (unsafeCompiler .
+     walkM
+       (renderAll $ RenderAllOptions {urlPrefix = Nothing, renderFormat = SVG}))
 
 customTeaserPandocCompiler :: Compiler (Item String)
 customTeaserPandocCompiler =
@@ -146,6 +164,52 @@ customTeaserPandocCompiler =
     defaultHakyllWriterOptions
     (walk stripHeading)
 
+-- Some code copy for pdf creation, taken from Hakyll.Web.Pandoc
+writePandocLatexWith :: Item String -> Item Pandoc -> Compiler (Item ByteString)
+writePandocLatexWith item (Item itemi doc) = do
+  author <- getStringFromContext "authorName"
+  title <- getStringFromContext "title"
+  date <- getStringFromContext "lastmod"
+  let variables = [("author", author), ("title", title), ("date", date)]
+  pdfString <-
+    unsafeCompiler $ do
+      template <- readFile "templates/post.tex"
+      let options = pdfHakyllWriterOptions variables template
+      pdf <- runIO $ makePDF "xelatex" [] writeLaTeX options doc
+      case pdf of
+        Left err -> error $ "Main.writePandocLatexWith:" ++ show err
+        Right result ->
+          case result of
+            Left err     -> error $ "Main.writePandocLatexWith:" ++ show err
+            Right result -> return result
+  makeItem pdfString
+  where
+    getString (StringField s) = return s
+    getStringFromContext s = unContext postCtx s [] item >>= getString
+
+relativizeUrlsWithCompiler :: String -> Item Pandoc -> Compiler (Item Pandoc)
+relativizeUrlsWithCompiler root item =
+  return $ fmap (walk $ relativizePandocUrls ".") item
+
+pdfHakyllWriterOptions :: [(String, String)] -> String -> WriterOptions
+pdfHakyllWriterOptions options template =
+  defaultHakyllWriterOptions
+    { writerSectionDivs = True
+    , writerTableOfContents = True
+    , writerTOCDepth = 4
+    , writerTemplate = Just template
+    , writerVariables = latexVariables
+    }
+  where
+    latexVariables :: [(String, String)]
+    latexVariables =
+      options ++
+      [ ("geometry", "margin=2cm")
+      , ("CJKmainfont", "Kozuka Mincho Pro")
+      , ("monofont", "Courier New")
+      ]
+
+-- TOC creation
 replaceTocExtension :: Item String -> Compiler (Item String)
 replaceTocExtension = return . fmap (withUrls replacer)
   where

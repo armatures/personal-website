@@ -47,7 +47,7 @@ import           Data.Text.Encoding     as E
 import           System.Directory
 import           System.Exit
 import           System.FilePath
-import           System.Process         (readProcessWithExitCode, system)
+import           System.Process         (readProcess, system)
 
 import           Text.Pandoc
 import           Text.Pandoc.JSON
@@ -61,16 +61,25 @@ hexSha3_512 bs = C8.pack $ show (hash bs :: Digest SHA3_512)
 sha :: Text -> Text
 sha = E.decodeUtf8 . hexSha3_512 . B16.encode . E.encodeUtf8
 
-fileName4Code :: Text -> Text -> Maybe Text -> FilePath
-fileName4Code name source ext = filename
+data RenderFormat
+  = SVG
+  | EPS
+  deriving (Show)
+
+fileName4Code :: RenderFormat -> Text -> Text -> Maybe Text -> FilePath
+fileName4Code format name source ext = filename
   where
     dirname = name ¤ "-images"
     shaN = sha source
+    extension =
+      case format of
+        SVG -> ".svg"
+        EPS -> ".eps"
     barename =
       shaN ¤
       (case ext of
-         Just "msc" -> ".svg"
-         Just "dot" -> ".svg"
+         Just "msc" -> extension
+         Just "dot" -> extension
          Just e     -> "." ¤ e
          Nothing    -> "")
     filename = T.unpack dirname </> T.unpack barename
@@ -81,39 +90,56 @@ getCaption m =
     Just cap -> (cap, "fig:")
     Nothing  -> ("", "")
 
-ensureFile fp =
+ensureWriteFile :: FilePath -> String -> IO ()
+ensureWriteFile fp contents = do
   let dir = takeDirectory fp
-   in createDirectoryIfMissing True dir >> doesFileExist fp >>= \exist ->
-        unless exist $ writeFile fp ""
+  createDirectoryIfMissing True dir
+  exists <- doesFileExist fp
+  unless exists $ writeFile fp contents
 
-renderDot :: String -> FilePath -> IO FilePath
-renderDot src dst =
-  readProcessWithExitCode "dot" ["-Tsvg", "-o" ++ show dst, "-"] src >>
+formatToFlag :: RenderFormat -> String
+formatToFlag format =
+  case format of
+    SVG -> "svg"
+    EPS -> "eps"
+
+renderDot :: RenderFormat -> String -> FilePath -> IO FilePath
+renderDot format src dst = do
+  ensureWriteFile dst =<< readProcess cmd args src
   return dst
+  where
+    cmd = "dot"
+    args = ["-T", formatToFlag format]
 
 -- Here is some msc rendering stuff
-renderMsc :: String -> FilePath -> IO FilePath
-renderMsc src dst =
-  readProcessWithExitCode "mscgen" ["-Tsvg", "-o" ++ show dst, "-"] src >>
+renderMsc :: RenderFormat -> String -> FilePath -> IO FilePath
+renderMsc format src dst = do
+  ensureWriteFile dst =<< readProcess cmd args src
   return dst
+  where
+    cmd = "mscgen"
+    args = ["-T", formatToFlag format, "-o", "-"]
 
 -- and we combine everything into one function
-renderAll :: Block -> IO Block
-renderAll cblock@(CodeBlock (id, classes, attrs) content)
+--
+data RenderAllOptions = RenderAllOptions
+  { urlPrefix    :: Maybe String
+  , renderFormat :: RenderFormat
+  } deriving (Show)
+
+renderAll :: RenderAllOptions -> Block -> IO Block
+renderAll options cblock@(CodeBlock (id, classes, attrs) content)
   | "msc" `elem` classes =
-    let dest = fileName4Code "mscgen" (T.pack content) (Just "msc")
-     in do ensureFile dest >> writeFile dest content
-           img <- renderMsc content dest
-           ensureFile img
+    let dest = fileName4Code format "mscgen" (T.pack content) (Just "msc")
+     in do img <- renderMsc format content dest
            return $ image img
   | "graphviz" `elem` classes =
-    let dest = fileName4Code "graphviz" (T.pack content) (Just "dot")
-     in do ensureFile dest >> writeFile dest content
-           img <- renderDot content dest
-           ensureFile img
+    let dest = fileName4Code format "graphviz" (T.pack content) (Just "dot")
+     in do img <- renderDot format content dest
            return $ image img
   | otherwise = return cblock
   where
+    format = renderFormat options
     toTextPairs = Prelude.map (\(f, s) -> (T.pack f, T.pack s))
     m = M.fromList $ toTextPairs attrs
     (caption, typedef) = getCaption m
@@ -122,9 +148,17 @@ renderAll cblock@(CodeBlock (id, classes, attrs) content)
         [ Image
             (id, classes, attrs)
             [Str $ T.unpack caption]
-            ("/" </> img, T.unpack caption)
+            ( case urlPrefix options of
+                Just prefix -> prefix </> img
+                Nothing     -> img
+            , T.unpack caption)
         ]
-renderAll x = return x
+renderAll pre x = return x
+
+relativizePandocUrls :: String -> Inline -> Inline
+relativizePandocUrls with (Image a b (url, title)) =
+  Image a b (with ++ url, title)
+relativizePandocUrls with x = x
 
 stripHeading :: Block -> Block
 stripHeading cblock@(Header level att content) = Null
