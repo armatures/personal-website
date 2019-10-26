@@ -206,12 +206,7 @@ pdfHakyllWriterOptions options template =
     }
   where
     latexVariables :: [(String, String)]
-    latexVariables =
-      options ++
-      [ ("geometry", "margin=2cm")
-      , ("CJKmainfont", "Kozuka Mincho Pro")
-      , ("monofont", "Courier New")
-      ]
+    latexVariables = options
 
 -- TOC creation
 replaceTocExtension :: Item String -> Compiler (Item String)
